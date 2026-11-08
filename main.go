@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"reflect"
 	"regexp"
@@ -11,6 +12,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cert-manager/cert-manager/pkg/acme/webhook/apis/acme/v1alpha1"
+	"github.com/cert-manager/cert-manager/pkg/acme/webhook/cmd/server"
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -21,16 +25,11 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/component-base/logs"
-	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
-
-	"github.com/cert-manager/cert-manager/pkg/acme/webhook/apis/acme/v1alpha1"
-	"github.com/cert-manager/cert-manager/pkg/acme/webhook/cmd/server"
-	logf "github.com/cert-manager/cert-manager/pkg/logs"
 )
 
-var log = logf.Log.WithName("kubehub")
-var GroupName = os.Getenv("GROUP_NAME")
+var logger = slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+var groupName = os.Getenv("GROUP_NAME")
 
 const (
 	configMapName      = "kubehub-dns01-challenge"
@@ -61,22 +60,22 @@ type kubehubDNSProviderSolver struct {
 }
 
 func main() {
-	if GroupName == "" {
-		klog.Fatal("GROUP_NAME environment variable must be set")
+	if groupName == "" {
+		logger.Error("GROUP_NAME environment variable must be set")
+		os.Exit(1)
 	}
-
 	logs.InitLogs()
 	defer logs.FlushLogs()
-	ctrl.SetLogger(logf.Log)
+	ctrl.SetLogger(logr.Discard())
 
 	solver := &kubehubDNSProviderSolver{}
-	ctx := logf.NewContext(ctrl.SetupSignalHandler(), logf.Log, "acme-dns-webhook")
+	ctx := ctrl.SetupSignalHandler()
 
-	command := server.NewCommandStartWebhookServer(ctx, GroupName, solver)
+	command := server.NewCommandStartWebhookServer(ctx, groupName, solver)
 	command.Flags().BoolVar(&solver.useCRD, "crd", false, "Track DNS01 challenges with DNS01Challenge custom resources instead of a ConfigMap")
 
 	if err := command.ExecuteContext(ctx); err != nil {
-		logf.Log.Error(err, "error executing command")
+		logger.Error("error executing webhook server", "error", err)
 		os.Exit(1)
 	}
 }
@@ -86,7 +85,7 @@ func (s *kubehubDNSProviderSolver) Name() string {
 }
 
 func (s *kubehubDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
-	log.Info("got request DNSName=%s, UID=%s", ch.DNSName, ch.UID)
+	logger.Info("received challenge request", challengeLogAttrs(ch)...)
 	if s.useCRD {
 		return s.processChallengeCR(ch, v1alpha1.ChallengeActionPresent)
 	}
@@ -94,23 +93,38 @@ func (s *kubehubDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error 
 }
 
 func (s *kubehubDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
-	log.Info("got request DNSName=%s, UID=%s", ch.DNSName, ch.UID)
+	logger.Info("received challenge request", challengeLogAttrs(ch)...)
 	if s.useCRD {
 		return s.processChallengeCR(ch, v1alpha1.ChallengeActionCleanUp)
 	}
 	return s.appendToConfigMap("Cleanup", ch)
 }
 
+func challengeLogAttrs(ch *v1alpha1.ChallengeRequest) []any {
+	return []any{
+		"uid", ch.UID,
+		"action", ch.Action,
+		"type", ch.Type,
+		"dns_name", ch.DNSName,
+		"key", ch.Key,
+		"resource_namespace", ch.ResourceNamespace,
+		"resolved_fqdn", ch.ResolvedFQDN,
+		"resolved_zone", ch.ResolvedZone,
+		"allow_ambient_credentials", ch.AllowAmbientCredentials,
+		"config", ch.Config,
+	}
+}
+
 func (s *kubehubDNSProviderSolver) Initialize(kubeClientConfig *rest.Config, stopCh <-chan struct{}) error {
 	client, err := kubernetes.NewForConfig(kubeClientConfig)
 	if err != nil {
-		log.Error(err, "failed to create kubernetes client: %s", err)
+		logger.Error("failed to create kubernetes client", "error", err)
 		return fmt.Errorf("failed to create kubernetes client: %w", err)
 	}
 
 	dynamicClient, err := dynamic.NewForConfig(kubeClientConfig)
 	if err != nil {
-		log.Error(err, "failed to create dynamic client: %s", err)
+		logger.Error("failed to create dynamic client", "error", err)
 		return fmt.Errorf("failed to create dynamic client: %w", err)
 	}
 
@@ -124,6 +138,7 @@ func (s *kubehubDNSProviderSolver) Initialize(kubeClientConfig *rest.Config, sto
 // waits for the controller to confirm the record is removed, and then deletes
 // the CR.
 func (s *kubehubDNSProviderSolver) processChallengeCR(ch *v1alpha1.ChallengeRequest, action v1alpha1.ChallengeAction) error {
+	logger.Info("starting DNS01Challenge operation", "name", challengeCRName(ch), "action", action, "dns_name", ch.DNSName, "uid", ch.UID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -157,16 +172,19 @@ func (s *kubehubDNSProviderSolver) processChallengeCR(ch *v1alpha1.ChallengeRequ
 	existing, err := resource.Get(ctx, name, metav1.GetOptions{})
 	switch {
 	case apierrors.IsNotFound(err):
+		logger.Info("DNS01Challenge not found; creating", "name", name, "action", action)
 		created, err := resource.Create(ctx, obj, metav1.CreateOptions{})
 		if err != nil {
-			log.Error(err, "failed to create DNS01Challenge", "name", name)
+			logger.Error("failed to create DNS01Challenge", "error", err, "name", name)
 			return fmt.Errorf("failed to create DNS01Challenge %q: %w", name, err)
 		}
 		generation = created.GetGeneration()
+		logger.Info("created DNS01Challenge", "name", name, "generation", generation, "action", action)
 	case err != nil:
-		log.Error(err, "failed to get DNS01Challenge", "name", name)
+		logger.Error("failed to get DNS01Challenge", "error", err, "name", name)
 		return fmt.Errorf("failed to get DNS01Challenge %q: %w", name, err)
 	case existing.GetDeletionTimestamp() != nil:
+		logger.Info("DNS01Challenge is pending deletion; waiting before recreating", "name", name, "action", action)
 		// The previous lifecycle is still being deleted. Wait for it to go
 		// away before creating a fresh object.
 		if err := s.waitForChallengeDeletion(ctx, name); err != nil {
@@ -174,29 +192,34 @@ func (s *kubehubDNSProviderSolver) processChallengeCR(ch *v1alpha1.ChallengeRequ
 		}
 		created, err := resource.Create(ctx, obj, metav1.CreateOptions{})
 		if err != nil {
-			log.Error(err, "failed to create DNS01Challenge", "name", name)
+			logger.Error("failed to create DNS01Challenge", "error", err, "name", name)
 			return fmt.Errorf("failed to create DNS01Challenge %q: %w", name, err)
 		}
 		generation = created.GetGeneration()
+		logger.Info("recreated DNS01Challenge", "name", name, "generation", generation, "action", action)
 	default:
+		logger.Info("found existing DNS01Challenge", "name", name, "generation", existing.GetGeneration(), "action", action)
 		existingSpec, _, err := unstructured.NestedStringMap(existing.Object, "spec")
 		if err != nil {
 			return fmt.Errorf("failed to read spec of DNS01Challenge %q: %w", name, err)
 		}
 		if reflect.DeepEqual(existingSpec, toStringMap(spec)) {
 			generation = existing.GetGeneration()
+			logger.Info("DNS01Challenge spec already matches; skipping update", "name", name, "generation", generation, "action", action)
 			break
 		}
 
 		existing.Object["spec"] = spec
 		updated, err := resource.Update(ctx, existing, metav1.UpdateOptions{})
 		if err != nil {
-			log.Error(err, "failed to update DNS01Challenge", "name", name)
+			logger.Error("failed to update DNS01Challenge", "error", err, "name", name)
 			return fmt.Errorf("failed to update DNS01Challenge %q: %w", name, err)
 		}
 		generation = updated.GetGeneration()
+		logger.Info("updated DNS01Challenge spec", "name", name, "generation", generation, "action", action)
 	}
 
+	logger.Info("waiting for DNS01Challenge to be processed", "name", name, "generation", generation, "action", action)
 	completed, waitErr := s.waitForChallengeProcessed(ctx, name, generation)
 	if waitErr != nil {
 		// A terminal failure means this phase will not complete. Drop the CR
@@ -204,8 +227,9 @@ func (s *kubehubDNSProviderSolver) processChallengeCR(ch *v1alpha1.ChallengeRequ
 		// On a timeout the CR is kept so the retry can observe the eventual
 		// result instead of racing the controller.
 		if completed {
+			logger.Info("processed DNS01Challenge failed; deleting completed object", "name", name, "action", action)
 			if deleteErr := s.deleteChallengeCR(ctx, name); deleteErr != nil {
-				log.Error(deleteErr, "failed to delete DNS01Challenge", "name", name)
+				logger.Error("failed to delete DNS01Challenge", "error", deleteErr, "name", name)
 			}
 		}
 		return waitErr
@@ -217,19 +241,22 @@ func (s *kubehubDNSProviderSolver) processChallengeCR(ch *v1alpha1.ChallengeRequ
 		if err := s.deleteChallengeCR(ctx, name); err != nil {
 			return err
 		}
-		log.Info("DNS01Challenge cleaned up", "name", name)
+		logger.Info("deleted DNS01Challenge after cleanup", "name", name, "action", action)
+		logger.Info("DNS01Challenge cleaned up", "name", name, "action", action, "uid", ch.UID)
 		return nil
 	}
 
-	log.Info("DNS01Challenge presented", "name", name)
+	logger.Info("DNS01Challenge presented", "name", name, "action", action, "uid", ch.UID)
 	return nil
 }
 
 func (s *kubehubDNSProviderSolver) deleteChallengeCR(ctx context.Context, name string) error {
+	logger.Info("deleting DNS01Challenge", "name", name)
 	resource := s.dynamicClient.Resource(dns01ChallengeGVR).Namespace(configMapNamespace)
 	if err := resource.Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("failed to delete DNS01Challenge %q: %w", name, err)
 	}
+	logger.Info("DNS01Challenge deletion requested", "name", name)
 	return nil
 }
 
@@ -245,6 +272,7 @@ func (s *kubehubDNSProviderSolver) waitForChallengeProcessed(ctx context.Context
 
 	var lastErr error
 	var completed bool
+	logger.Info("polling DNS01Challenge status", "name", name, "generation", generation, "poll_interval", crdPollInterval, "timeout", crdWaitTimeout)
 	err := wait.PollUntilContextTimeout(waitCtx, crdPollInterval, crdWaitTimeout, true, func(ctx context.Context) (bool, error) {
 		obj, err := resource.Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
@@ -269,8 +297,10 @@ func (s *kubehubDNSProviderSolver) waitForChallengeProcessed(ctx context.Context
 			observedGeneration = nestedInt64(obj.Object, "status", "observedGeneration")
 		}
 		if observedGeneration < generation {
+			logger.Info("ignoring stale DNS01Challenge condition", "name", name, "generation", generation, "observed_generation", observedGeneration, "status", status)
 			return false, nil
 		}
+		logger.Info("observed DNS01Challenge condition", "name", name, "generation", generation, "observed_generation", observedGeneration, "status", status, "message", message)
 
 		switch status {
 		case string(metav1.ConditionTrue):
@@ -296,7 +326,7 @@ func (s *kubehubDNSProviderSolver) waitForChallengeProcessed(ctx context.Context
 		return false, fmt.Errorf("failed to wait for DNS01Challenge %q to be processed: %w", name, err)
 	}
 
-	log.Info("DNS01Challenge processed", "name", name, "generation", generation)
+	logger.Info("DNS01Challenge processed", "name", name, "generation", generation)
 	return true, nil
 }
 
@@ -398,15 +428,17 @@ func toStringMap(in map[string]interface{}) map[string]string {
 }
 
 func (s *kubehubDNSProviderSolver) appendToConfigMap(field string, ch *v1alpha1.ChallengeRequest) error {
+	logger.Info("updating challenge state", "field", field, "dns_name", ch.DNSName, "uid", ch.UID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	cm, err := s.client.CoreV1().ConfigMaps(configMapNamespace).Get(context.Background(), configMapName, metav1.GetOptions{})
 	if err != nil {
 		if !apierrors.IsNotFound(err) {
-			log.Error(err, "failed to get configmap: %s", err)
+			logger.Error("failed to get configmap", "error", err, "name", configMapName, "namespace", configMapNamespace)
 			return fmt.Errorf("failed to get configmap: %w", err)
 		}
+		logger.Info("challenge state ConfigMap does not exist; creating it", "name", configMapName, "namespace", configMapNamespace)
 		cm = &corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      configMapName,
@@ -419,7 +451,7 @@ func (s *kubehubDNSProviderSolver) appendToConfigMap(field string, ch *v1alpha1.
 		}
 		cm, err = s.client.CoreV1().ConfigMaps(configMapNamespace).Create(context.Background(), cm, metav1.CreateOptions{})
 		if err != nil {
-			log.Error(err, "failed to create configmap: %s", err)
+			logger.Error("failed to create configmap", "error", err, "name", configMapName, "namespace", configMapNamespace)
 			return fmt.Errorf("failed to create configmap: %w", err)
 		}
 	}
@@ -427,17 +459,18 @@ func (s *kubehubDNSProviderSolver) appendToConfigMap(field string, ch *v1alpha1.
 	entries := map[string]json.RawMessage{}
 	if data, ok := cm.Data[field]; ok && data != "" {
 		if err := json.Unmarshal([]byte(data), &entries); err != nil {
-			log.Error(err, "failed to unmarshal %q field: %s", field, err)
+			logger.Error("failed to unmarshal ConfigMap field", "error", err, "field", field)
 			return fmt.Errorf("failed to unmarshal %q field: %w", field, err)
 		}
 	}
+	logger.Info("loaded challenge state", "field", field, "entry_count", len(entries))
 
 	chBytes, err := json.Marshal(ch)
-	log.Info("requestPayload=%s, UID=%s", ch.UID, string(chBytes))
 	if err != nil {
-		log.Error(err, "failed to marshal challenge request: %s", err)
+		logger.Error("failed to marshal challenge request", "error", err, "uid", ch.UID)
 		return fmt.Errorf("failed to marshal challenge request: %w", err)
 	}
+	logger.Info("challenge request payload", "field", field, "uid", ch.UID, "payload", string(chBytes))
 
 	existingRaw, exists := entries[ch.DNSName]
 	if exists {
@@ -453,16 +486,17 @@ func (s *kubehubDNSProviderSolver) appendToConfigMap(field string, ch *v1alpha1.
 			}
 		}
 		if !needsUpdate {
-			log.Info("Skipping update for %s key=%s, entry already up to date", field, ch.DNSName)
+			logger.Info("skipping ConfigMap update; challenge state is already up to date", "field", field, "dns_name", ch.DNSName, "uid", ch.UID)
 			return nil
 		}
+		logger.Info("existing challenge state differs; replacing it", "field", field, "dns_name", ch.DNSName, "uid", ch.UID)
 	}
 
 	entries[ch.DNSName] = json.RawMessage(chBytes)
 
 	data, err := json.Marshal(entries)
 	if err != nil {
-		log.Error(err, "failed to marshal entries: %s", err)
+		logger.Error("failed to marshal challenge entries", "error", err, "field", field)
 		return fmt.Errorf("failed to marshal entries: %w", err)
 	}
 
@@ -473,9 +507,10 @@ func (s *kubehubDNSProviderSolver) appendToConfigMap(field string, ch *v1alpha1.
 
 	_, err = s.client.CoreV1().ConfigMaps(configMapNamespace).Update(context.Background(), cm, metav1.UpdateOptions{})
 	if err != nil {
-		log.Error(err, "failed to update configmap: %s", err)
+		logger.Error("failed to update challenge state ConfigMap", "error", err, "field", field, "dns_name", ch.DNSName)
 		return fmt.Errorf("failed to update configmap: %w", err)
 	}
+	logger.Info("updated challenge state ConfigMap", "field", field, "dns_name", ch.DNSName, "uid", ch.UID)
 
 	return nil
 }
