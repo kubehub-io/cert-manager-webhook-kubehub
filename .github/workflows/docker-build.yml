@@ -7,11 +7,18 @@ on:
   pull_request:
     branches:
       - main
+  release:
+    types:
+      - published
   workflow_dispatch:
 
 permissions:
   contents: read
   packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  PUSH_IMAGE: ${{ github.event_name == 'release' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
 
 jobs:
   build-and-push:
@@ -20,14 +27,28 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Set image tag
+      - name: Determine image tag
+        id: image
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
         run: |
-          DATE=$(date +%Y%m%d)
-          REV=$((GITHUB_RUN_NUMBER))
+          if [ -n "$RELEASE_TAG" ]; then
+            TAG="$RELEASE_TAG"
+          else
+            TAG="main-$(date -u +%Y%m%d)-${GITHUB_RUN_NUMBER}"
+          fi
 
-          echo "DATE=$DATE" >> "$GITHUB_ENV"
-          echo "REV=$REV" >> "$GITHUB_ENV"
-          echo "IMAGE_TAG=main-$DATE-$REV" >> "$GITHUB_ENV"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "tags<<EOF"
+            echo "${IMAGE}:${TAG}"
+            if [ -n "$RELEASE_TAG" ] && [ "$PRERELEASE" != "true" ]; then
+              echo "${IMAGE}:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU (for cross-platform emulation)
         uses: docker/setup-qemu-action@v4
@@ -41,7 +62,7 @@ jobs:
           install: true
 
       - name: Log in to GitHub Container Registry
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        if: env.PUSH_IMAGE == 'true'
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -54,9 +75,8 @@ jobs:
           builder: ${{ steps.buildx.outputs.name }}
           context: .
           file: ./Dockerfile
-          push: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+          push: ${{ env.PUSH_IMAGE == 'true' }}
           platforms: linux/amd64,linux/arm64
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ env.IMAGE_TAG }}
+          tags: ${{ steps.image.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
