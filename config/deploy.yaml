@@ -1,0 +1,213 @@
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: kubehub-certmgr-webhook-issuer
+  namespace: cert-manager
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: kubehub-certmgr-webhook-ca
+  namespace: cert-manager
+spec:
+  isCA: true
+  literalSubject: CN=kubehub-certmgr-webhook-ca
+  secretName: kubehub-certmgr-webhook-ca-secret
+  duration: 262800h0m0s
+  issuerRef:
+    name: kubehub-certmgr-webhook-issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: kubehub-certmgr-webhook-ca-issuer
+  namespace: cert-manager
+spec:
+  ca:
+    secretName: kubehub-certmgr-webhook-ca-secret
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: kubehub-certmgr-webhook-server
+  namespace: cert-manager
+spec:
+  secretName: kubehub-certmgr-webhook-server-tls
+  literalSubject: CN=kubehub-certmgr-webhook
+  duration: 8760h0m0s 
+  dnsNames:
+  - certmgr-webhook-kubehub
+  - certmgr-webhook-kubehub.cert-manager.svc
+  issuerRef:
+    name: kubehub-certmgr-webhook-ca-issuer
+---
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1alpha1.acme.kubehub.io
+  annotations:
+    cert-manager.io/inject-ca-from: "cert-manager/kubehub-certmgr-webhook-server"
+spec:
+  group: acme.kubehub.io
+  groupPriorityMinimum: 1000
+  versionPriority: 15
+  service:
+    name: certmgr-webhook-kubehub
+    namespace: cert-manager
+  version: v1alpha1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cert-manager-webhook-kubehub
+  namespace: cert-manager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cert-manager-webhook-kubehub
+  template:
+    metadata:
+      labels:
+        app: cert-manager-webhook-kubehub
+    spec:
+      serviceAccountName: kubehub-webhook-sa
+      automountServiceAccountToken: true
+      containers:
+      - name: webhook-server
+        image: ghcr.io/kubehub-io/cert-manager-webhook-kubehub:main-20261108-26
+        env:
+        - name: GROUP_NAME
+          value: acme.kubehub.io
+        command: ["/app/certmgr-webhook"]
+        args:
+        - --crd
+        - --secure-port=8443
+        - --tls-cert-file=/tls/tls.crt
+        - --tls-private-key-file=/tls/tls.key
+        volumeMounts:
+          - name: certs
+            mountPath: /tls
+            readOnly: true
+      dnsPolicy: ClusterFirst
+      volumes:
+        - name: certs
+          secret:
+            secretName: kubehub-certmgr-webhook-server-tls
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: certmgr-webhook-kubehub
+  namespace: cert-manager
+spec:
+  ports:
+  - name: https
+    protocol: TCP
+    port: 443
+    targetPort: 8443
+  selector:
+    app: cert-manager-webhook-kubehub
+  type: ClusterIP
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubehub-webhook-sa
+  namespace: cert-manager
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kubehub-webhook-role
+  namespace: cert-manager
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["create", "get", "update"]
+- apiGroups:
+  - gateway.kubehub.io
+  resources:
+  - dns01challenges
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kubehub-webhook-rolebinding
+  namespace: cert-manager
+subjects:
+- kind: ServiceAccount
+  name: kubehub-webhook-sa
+roleRef:
+  kind: Role
+  name: kubehub-webhook-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kubehub-webhook-authentication-reader
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: extension-apiserver-authentication-reader
+subjects:
+  - apiGroup: ""
+    kind: ServiceAccount
+    name: kubehub-webhook-sa
+    namespace: cert-manager
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubehub-webhook-auth-delegator
+subjects:
+- kind: ServiceAccount
+  name: kubehub-webhook-sa
+  namespace: cert-manager
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cert-manager-acme-kubehub
+rules:
+- apiGroups:
+  - acme.kubehub.io
+  resources:
+  - default
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cert-manager-acme-kubehub
+subjects:
+- kind: ServiceAccount
+  name: cert-manager
+  namespace: cert-manager
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cert-manager-acme-kubehub
