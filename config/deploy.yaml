@@ -77,7 +77,7 @@ spec:
       automountServiceAccountToken: true
       containers:
       - name: webhook-server
-        image: ghcr.io/kubehub-io/cert-manager-webhook-kubehub:main-20261108-26
+        image: ghcr.io/kubehub-io/cert-manager-webhook-kubehub:latest
         env:
         - name: GROUP_NAME
           value: acme.kubehub.io
